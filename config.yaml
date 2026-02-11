@@ -1,0 +1,64 @@
+data:
+  target_data: 'vspw'
+  vspw_root_dir: '/scratch-nvme/joshua68/VSPW'
+  vspw_label_map: '/scratch-nvme/joshua68/VSPW/label_num_dic_final.json'
+  vspw_num_classes: 124
+  ignore_index: 255
+  split_names:
+    train: 'train.txt'
+    val: 'val.txt'
+    test: 'test.txt'
+  voc_root_dir: '/path/to/VOCdevkit/'
+  ade_root_dir: '/path/to/ADEChallengeData2016/'
+  voc_num_classes: 21
+  ade_num_classes: 150
+
+parameters:
+  batch_size: 3
+  learning_rate: 0.001
+  num_epochs: 10
+  warmup_steps: 100
+  max_prompts: 1024
+  max_grad_norm: -1
+  accumulation_steps: 1
+  logging_steps: 400
+  num_workers: 12
+  merge_similarity: 0.9
+logging:
+  save_dir: 'logs/'
+  exp_name: 'vspw'
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '/path/to/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 518
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 50
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    merge_similarity: 0.9
+    num_workers: 16
+
+  logging:
+    save_dir: '../logs/'
+    exp_name: 'ren-dinov2-vitl14'
