@@ -1,4 +1,5 @@
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+import os
+import sys
 import math
 import yaml
 import random
@@ -11,12 +12,12 @@ from torch.utils.data import DataLoader, random_split
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import autocast, GradScaler
-from video_dataloader import VSPWClipDataset
-from decoder import VSPWDecoderLinear
+from dataloader import VOCSegmentation, ADESegmentation
+from models import VOCDecoderLinear, ADEDecoderLinear
 
 sys.path.append('..')
 sys.path.append('../segment_anything/')
-from model import FeatureExtractor, RegionEncoder, TokenAggregator
+from model import FeatureExtractor, RegionEncoder
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -38,37 +39,23 @@ class Trainer():
         print(f'Configs: {config}')
 
         # Instantiate the dataloaders
-        train_dataset = VSPWClipDataset(
-            config,
-            split="train",
-            augment=True,
-            frames_per_video=3,
-            sampling="window",
-            seed=seed,
-        )
-        val_dataset = VSPWClipDataset(
-            config,
-            split="val",
-            augment=False,
-            frames_per_video=3,
-            sampling="window",
-            seed=seed,
-        )
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config['parameters']['batch_size'],
-            num_workers=config['parameters']['num_workers'],
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True,
-        )
-        self.val_loader = DataLoader(
-            val_dataset,
-            batch_size=config['parameters']['batch_size'],
-            num_workers=10,
-            shuffle=False,
-            pin_memory=True,
-        )
+        if config['data']['target_data'] == 'pascal_voc':
+            dataset = VOCSegmentation(config, image_set='trainval')
+            train_size = int(0.95 * len(dataset))
+            val_size = len(dataset) - train_size
+            train_subset, val_subset = random_split(dataset, [train_size, val_size])
+            self.train_loader = DataLoader(train_subset, batch_size=config['parameters']['batch_size'],
+                                           num_workers=config['parameters']['num_workers'], shuffle=True, pin_memory=True)
+            self.val_loader = DataLoader(val_subset, batch_size=config['parameters']['batch_size'],
+                                         num_workers=config['parameters']['num_workers'], pin_memory=True)
+        elif config['data']['target_data'] == 'ade20k':
+            train_dataset = ADESegmentation(config, split='training')
+            val_dataset = ADESegmentation(config, split='validation')
+            self.train_loader = DataLoader(train_dataset, batch_size=config['parameters']['batch_size'],
+                                           num_workers=config['parameters']['num_workers'], shuffle=True, pin_memory=True)
+            self.val_loader = DataLoader(val_dataset, batch_size=config['parameters']['batch_size'],
+                                         num_workers=config['parameters']['num_workers'], pin_memory=True)
+        
         # Set training parameters
         self.num_epochs = config['parameters']['num_epochs']
         self.total_steps = self.num_epochs * len(self.train_loader)
@@ -83,8 +70,10 @@ class Trainer():
         self.patch_size = config['ren']['pretrained']['patch_sizes'][0]
         self.feature_extractor = FeatureExtractor(config['ren'], device=device)
         self.region_encoder = RegionEncoder(config['ren']).to(device)
-        #self.token_aggregator = TokenAggregator(config['ren'])
-        self.decoder = VSPWDecoderLinear(config).to(device)
+        if config['data']['target_data'] == 'pascal_voc':
+            self.decoder = VOCDecoderLinear(config).to(device)
+        elif config['data']['target_data'] == 'ade20k':
+            self.decoder = ADEDecoderLinear(config).to(device)
 
         # Create prompts for region encoder
         self.image_resolution = config['ren']['parameters']['image_resolution']
@@ -151,32 +140,30 @@ class Trainer():
         images = batch['image'].to(device)
         masks = batch['mask'].to(device)
         batch_size = images.shape[0]
-        B, T, C, H, W = images.shape
-        images_flat = images.view(B * T, C, H, W)
-        masks_flat = masks.view(B * T, H, W)
+
         with autocast(dtype=torch.bfloat16):
             # Compute outputs
             with torch.no_grad():
-                _, feature_maps = self.feature_extractor(self.extractor_name, images_flat, resize=False)
-                #prompts = [self.grid_points for _ in range(batch_size)]
-                #region_tokens = self.region_encoder(feature_maps, prompts)['pred_tokens']
-                #region_tokens = region_tokens.view(batch_size, self.grid_size, self.grid_size, -1)
-            #print(region_tokens.shape)
-            outputs = self.decoder(feature_maps)
+                _, feature_maps = self.feature_extractor(self.extractor_name, images, resize=False)
+                prompts = [self.grid_points for _ in range(batch_size)]
+                region_tokens = self.region_encoder(feature_maps, prompts)['pred_tokens']
+                region_tokens = region_tokens.view(batch_size, self.grid_size, self.grid_size, -1)
+            outputs = self.decoder(region_tokens.permute(0, 3, 1, 2))
 
             # Resize the outputs to the desired dimensions
             resized_outputs = torch.nn.functional.interpolate(outputs, size=[self.image_resolution, self.image_resolution],
                                                               mode='bilinear')
             resized_outputs = resized_outputs.flatten(-2).permute(0, 2, 1).reshape(-1, outputs.shape[1])
-
-            targets = masks_flat.view(-1)
+            
+            # Compute loss
+            targets = masks.view(-1)
             loss = F.cross_entropy(resized_outputs, targets, ignore_index=255, reduction='mean')
-
+            
         return {
             'outputs': outputs,
             'loss': loss,
         }
-
+    
     def validate(self):
         loss = 0
         with torch.no_grad():
@@ -190,14 +177,12 @@ class Trainer():
         iter_count = self.start_iter
         self.optimizer.zero_grad()
         for epoch in range(self.start_epoch, self.num_epochs):
-            self.train_loader.dataset.set_epoch(epoch)
             self.decoder.train()
-            pbar = tqdm(self.train_loader, desc=f'Running epoch {epoch}')
-            for batch in pbar:
+            for batch in tqdm(self.train_loader, desc=f'Running epoch {epoch}'):
                 # Forward pass
                 train_outputs = self.step(batch)
                 train_loss = train_outputs['loss']
-                pbar.set_postfix(loss=f"{train_loss.item():.4f}")
+
                 # Backward pass
                 self.scaler.scale(train_loss).backward()
                 if self.max_grad_norm != -1:
@@ -207,7 +192,7 @@ class Trainer():
                     self.scaler.update()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
-
+                
                 # Log progress
                 if (iter_count + 1) % self.logging_steps == 0:
                     val_outputs = self.validate()
@@ -219,7 +204,6 @@ class Trainer():
                             'val_loss': val_loss,
                             'learning_rate': self.optimizer.param_groups[0]['lr'],
                         })
-
                 iter_count += 1
 
 
