@@ -1,0 +1,53 @@
+data:
+  # For image-only training use e.g. ['coco_train']; for video add 'vspw_train'
+  train_datasets:
+    - 'sav_train'
+  val_datasets:
+    - 'sav_val'
+  weights:
+    - 1.0
+  sav_train_root: '/scratch-nvme/joshua68/SAV/sav_train'
+  sav_val_root: '/scratch-nvme/joshua68/SAV/sav_val'
+  sav_train_cache_root: '/scratch-nvme/joshua68/SAV/sav_cache_train'
+  sav_val_cache_root:   '/scratch-nvme/joshua68/SAV/sav_cache_val'
+  frames_per_video: 5         # frames per clip (used by VideoRENDataset and MLP input size)
+  sampling: 'window'         # 'window' or 'first'
+
+pretrained:
+  feature_extractors:
+    - 'dinov2_vitl14'
+  patch_sizes:
+    - 14
+  region_extractor: 'sam2_hierra'
+  # SAM2 checkpoint: use a local path to sam2.1_hiera_large.pt, or a Hugging Face model ID to auto-download
+  # Download: https://huggingface.co/facebook/sam2.1-hiera-large (file: sam2.1_hiera_large.pt)
+  # Or set to 'facebook/sam2.1-hiera-large' to download from Hugging Face (requires huggingface_hub)
+  sam2_hieral_ckpt: 'facebook/sam2.1-hiera-large'
+  sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+architecture:
+  grid_size: 518
+  hidden_dim: 1024
+  decoder_layers: 4
+  num_attention_heads: 8
+
+parameters:
+  sav_ann_source: 'prefer_manual'
+  image_resolution: 518
+  batch_size: 3
+  learning_rate: 0.001
+  num_epochs: 50
+  max_prompts: 256
+  accumulation_steps: 1
+  warmup_steps: 100
+  logging_steps: 200
+  max_grad_norm: 5.0
+  upsample_features: False
+  deduplicate_masks: False
+  merge_similarity: 0.975
+  num_workers: 12
+  seed: 42   # used by VideoRENDataset for frame sampling
+
+logging:
+  save_dir: 'logs'
+  exp_name: 'ren-dinov2-vitl14'

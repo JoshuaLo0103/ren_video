@@ -17,9 +17,9 @@ from model import FeatureExtractor, RegionTokensGenerator, RegionEncoder
 from task_utils import print_log
 
 
-device = 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 seed = 42
-use_wandb = 0
+use_wandb = 1
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 np.random.seed(seed)
@@ -47,7 +47,7 @@ class Trainer:
 
         # Set training parameters
         self.num_epochs = config['parameters']['num_epochs']
-        self.total_steps = 50 #self.num_epochs * len(self.train_loader) // config['parameters']['batch_size']
+        self.total_steps = self.num_epochs * len(self.train_loader) // config['parameters']['batch_size']
         self.accumulation_steps = config['parameters']['accumulation_steps']
         self.warmup_steps = config['parameters']['warmup_steps']
         self.logging_steps = config['parameters']['logging_steps']
@@ -226,7 +226,7 @@ class Trainer:
             'loss': loss,
         }
     
-    def validate(self, extractor_name, num_batches=1):
+    def validate(self, extractor_name, num_batches=10):
         loss_cont, loss_feat, loss = 0, 0, 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_loader):
@@ -250,10 +250,8 @@ class Trainer:
         self.optimizer.zero_grad()
         for epoch in range(self.start_epoch, self.num_epochs):
             self.region_encoder.train()
-            for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f'Running epoch {epoch}')):
+            for batch in tqdm(self.train_loader, desc=f'Running epoch {epoch}'):
                 # Forward pass
-                if batch_idx >= 50:
-                    break
                 extractor_name = random.choice(self.extractor_names)
                 train_outputs = self.step(batch, extractor_name)
                 train_loss = train_outputs['loss']

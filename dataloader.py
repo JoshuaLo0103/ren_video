@@ -25,7 +25,7 @@ from segment_anything.sam2.automatic_mask_generator import SAM2AutomaticMaskGene
 from task_utils import deduplicate_masks
 
 
-device = 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def collate_fn(batch):
@@ -89,9 +89,7 @@ class COCODataset(Dataset):
         ])
 
         # Run SAM on all images in the data pool and save mask RLEs in a json file
-        for iii, image_idx in enumerate(tqdm(range(len(self)), desc=f'Saving mask RLEs for coco2017 {self.split}')):
-            if iii >= 10:
-                break
+        for image_idx in tqdm(range(len(self)), desc=f'Saving mask RLEs for coco2017 {self.split}'):
             image_info = self.coco.loadImgs(self.image_ids[image_idx])[0]
             image_path = os.path.join(self.image_dir, image_info['file_name'])
             image = Image.open(image_path).convert('RGB')
@@ -108,9 +106,7 @@ class COCODataset(Dataset):
         metadata = {}
         offset = 0
         with open(self.binary_cache_path, 'wb') as binary_file:
-            for iii, image_idx in enumerate(tqdm(range(len(self)), desc=f'Saving mask binary for coco2017 {self.split}')):
-                if iii >= 10:
-                    break
+            for image_idx in tqdm(range(len(self)), desc=f'Saving mask binary for coco2017 {self.split}'):
                 json_path = os.path.join(self.rle_cache_dir, f'coco2017-{self.split}-{image_idx}.json')
                 
                 # Load masks and convert them to binary format

@@ -1,0 +1,54 @@
+data:
+  train_datasets: 
+    - 'ego4d_train'
+  val_datasets: 
+    - 'ego4d_val'
+  weights:
+    - 1.0
+  coco_train_images_dir: '/path/to/coco2017/train2017/'
+  coco_val_images_dir: '/path/to/coco2017/val2017/'
+  coco_train_annotations_path: '/path/to/coco2017/annotations/instances_train2017.json'
+  coco_val_annotations_path: '/path/to/coco2017/annotations/instances_val2017.json'
+  coco_regions_rle_cache_dir: '/path/to/save/coco_region_rles/'
+  coco_regions_binary_cache_dir: '/path/to/save/coco_region_binaries/'
+  are_coco_rles_cached: False
+  ego4d_train_images_dir: '/path/to/vq2d/records/train/'
+  ego4d_val_images_dir: '/path/to/vq2d/records/val/'
+  ego4d_train_regions_rle_cache_dir: '/path/to/vq2d/masks/train/'
+  ego4d_val_regions_rle_cache_dir: '/path/to/save/vq2d/masks/val/'
+  ego4d_regions_binary_cache_dir: '/path/to/save/vq2d/ego4d_region_binaries_3k/'
+  are_ego4d_rles_cached: True
+
+pretrained:
+  feature_extractors:
+    - 'openclip_vitg14'
+  patch_sizes:
+    - 14
+  region_extractor: 'sam2_hierra'
+  sam2_hieral_ckpt: '/path/to/sam2.1_hiera_large.pt'
+  sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+architecture:
+  grid_size: 224
+  hidden_dim: 1408
+  decoder_layers: 4
+  num_attention_heads: 8
+
+parameters:
+  image_resolution: 224
+  batch_size: 16
+  learning_rate: 0.001
+  num_epochs: 50
+  max_prompts: 256
+  accumulation_steps: 1
+  warmup_steps: 100
+  logging_steps: 50
+  max_grad_norm: 5.0
+  upsample_features: False
+  deduplicate_masks: False
+  merge_similarity: 0.975
+  num_workers: 16
+
+logging:
+  save_dir: 'logs'
+  exp_name: 'ren-openclip-vitg14'

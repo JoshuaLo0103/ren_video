@@ -1,0 +1,40 @@
+parameters:
+  batch_size: 32
+  image_resolution: 384
+  grid_size: 48
+  use_slic: True
+  aggregate_tokens: True
+  token_variant: 'ren'
+  feature_extractor: 'dino_vitb8'
+  ren_ckpt: 'logs/ren-dino-vitb8/checkpoint.pth'
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dino_vitb8'
+    patch_sizes:
+      - 8
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '/path/to/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 384
+    hidden_dim: 768
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 384
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 50
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    merge_similarity: 0.975
+    num_workers: 16
