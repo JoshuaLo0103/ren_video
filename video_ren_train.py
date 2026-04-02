@@ -19,7 +19,7 @@ from task_utils import print_log
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-seed = 23 # new seed
+seed = 777 # new seed
 use_wandb = False  # Set to True to enable wandb logging
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -76,48 +76,31 @@ class Trainer:
             nn.Linear(D, D),
             nn.GELU(),
             nn.Linear(D, D),
-        ).to(device)        
-        # Freeze everything except MLP
-        
+        ).to(device)
+        # Freeze backbone, region pooling, and REN encoder; train only the temporal MLP head.
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
         self.feature_extractor.eval()
-        #for param in self.region_tokens_generator.parameters():
-        #    param.requires_grad = False
+
+        # RegionTokensGenerator is stateless (no nn.Module / no parameters); pooling only.
 
         for p in self.region_encoder.parameters():
             p.requires_grad = False
-
-        k = 2
-        for layer in self.region_encoder.region_attention_layers[-k:]:
-            for p in layer.parameters():
-                p.requires_grad = True  
-                  
-        for p in self.region_encoder.out_norm.parameters():
-            p.requires_grad = True
-        for p in self.region_encoder.out_proj.parameters():
-            p.requires_grad = True
-
-        self.region_encoder.train()
+        self.region_encoder.eval()
 
         for param in self.mlp.parameters():
             param.requires_grad_(True)
-
         self.mlp.train()
 
         self.frames_per_video = config.get('data', {}).get('frames_per_video', 5)
-        trainable_params = []
-
-        trainable_params += [p for p in self.mlp.parameters() if p.requires_grad]
-        trainable_params += [p for p in self.region_encoder.parameters() if p.requires_grad]
-
+        trainable_params = list(self.mlp.parameters())
         self.optimizer = optim.AdamW(trainable_params, lr=config['parameters']['learning_rate'])
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=self.lr_lambda)
 
         # Initialize training state
         self.start_epoch = 0
         self.start_iter = 0
-        self.checkpoint_path = os.path.join(self.exp_dir, 'checkpoint.pth')
+        self.checkpoint_path = os.path.join(self.exp_dir, 'checkpoint_latest.pth')
         self.best_val_loss = float('inf')
 
         # Load checkpoint if it exists
@@ -160,8 +143,9 @@ class Trainer:
         # If your old checkpoint saved RegionEncoder weights, load them here:
         try_load(self.region_encoder, ['region_encoder_state', 'model_state', 'state_dict', 'region_encoder'], 'region_encoder')
 
-        # If you used to train RegionTokensGenerator and saved it:
-        try_load(self.region_tokens_generator, ['region_tokens_generator_state', 'tokens_generator_state'], 'region_tokens_generator')
+        # RegionTokensGenerator has no weights unless it becomes an nn.Module.
+        if hasattr(self.region_tokens_generator, 'load_state_dict'):
+            try_load(self.region_tokens_generator, ['region_tokens_generator_state', 'tokens_generator_state'], 'region_tokens_generator')
 
         # If you ever saved FeatureExtractor (usually you don’t, since it’s pretrained):
         try_load(self.feature_extractor, ['feature_extractor_state'], 'feature_extractor')
@@ -355,50 +339,39 @@ class Trainer:
                 region_tokens_v2 = self.region_tokens_generator(feats_v2, v2_regions_bt)  # [BT,P,D]
                 region_tokens_v1 = torch.stack(region_tokens_v1, dim=0)
                 region_tokens_v2 = torch.stack(region_tokens_v2, dim=0)
-        # ===== trainable head + losses =====
+
+                outputs_v1 = self.region_encoder(feats_v1, v1_grid_bt)
+                outputs_v2 = self.region_encoder(feats_v2, v2_grid_bt)
+
+                pred_v1 = outputs_v1["pred_tokens"]     # [BT,P,D]
+                pred_v2 = outputs_v2["pred_tokens"]
+                proj_v1 = outputs_v1["proj_tokens"]
+                proj_v2 = outputs_v2["proj_tokens"]
+
+                BT, P_check, D = pred_v1.shape
+                assert BT == B * T
+                assert P_check == P
+                BT2, P_check2, D2 = region_tokens_v1.shape
+                assert BT2 == B * T
+                assert P_check2 == P
+                assert D2 == D, f"Token dim mismatch: pred D={D}, region_tokens D={D2}"
+
+                loss_cont = self.region_aware_contrastive_loss(pred_v1, pred_v2, v1_ids_bt, v2_ids_bt)
+                loss_feat = self.feature_similarity_loss(
+                    proj_v1, proj_v2,
+                    region_tokens_v1, region_tokens_v2,
+                    v1_lm_bt, v2_lm_bt
+                )
+        # MLP-only backward: encoder outputs are detached; optimize loss_temp only.
+        pred_seq = pred_v1.view(B, T, P, D)
         with autocast(dtype=torch.bfloat16):
-
-            outputs_v1 = self.region_encoder(feats_v1, v1_grid_bt)
-            outputs_v2 = self.region_encoder(feats_v2, v2_grid_bt)
-
-            pred_v1 = outputs_v1["pred_tokens"]     # [BT,P,D]
-            pred_v2 = outputs_v2["pred_tokens"]
-            proj_v1 = outputs_v1["proj_tokens"]
-            proj_v2 = outputs_v2["proj_tokens"]
-
-            # --- asserts ---
-            BT, P_check, D = pred_v1.shape
-            assert BT == B*T
-            assert P_check == P
-
-            BT2, P_check2, D2 = region_tokens_v1.shape
-            assert BT2 == B*T
-            assert P_check2 == P
-            assert D2 == D, f"Token dim mismatch: pred D={D}, region_tokens D={D2}"
-
-            # --- build pred_seq for temporal prediction ---
-            pred_seq = pred_v1.view(B, T, P, D)     # [B,T,P,D]
-
-            # --- losses ---
-            loss_cont = self.region_aware_contrastive_loss(pred_v1, pred_v2, v1_ids_bt, v2_ids_bt)
-
-            loss_feat = self.feature_similarity_loss(
-                proj_v1, proj_v2,
-                region_tokens_v1, region_tokens_v2,
-                v1_lm_bt, v2_lm_bt
-            )
-
-            # --- temporal next-frame loss: maximize cosine sim between mlp(pred_t) and pred_{t+1} ---
-            # Same grid index i: pull mlp(ren_t[i]) toward ren_{t+1}[i] (target detached). Masked
-            # by valid prompts on both frames.
             eps = 1e-8
             loss_temp = torch.zeros((), device=pred_seq.device, dtype=pred_seq.dtype)
             count = 0
             for t in range(T - 1):
                 ctx = pred_seq[:, t]
-                tgt = pred_seq[:, t + 1].detach()
+                tgt = pred_seq[:, t + 1]
                 pred_next = self.mlp(ctx)
-
                 per_pos = 1.0 - F.cosine_similarity(pred_next, tgt, dim=-1, eps=eps)
                 valid = (v1_loss_mask[:, t] * v1_loss_mask[:, t + 1]).float()
                 denom = valid.sum().clamp(min=1e-6)
@@ -409,7 +382,12 @@ class Trainer:
             if count > 0:
                 loss_temp = loss_temp / count
 
-            loss = loss_cont + loss_feat +  loss_temp
+            # If no valid (t, t+1) pairs, loss_temp is a plain zero scalar (no graph).
+            # GradScaler.backward() needs a tensor tied to trainable params.
+            if count > 0:
+                loss = loss_temp
+            else:
+                loss = sum((p * 0.0).sum() for p in self.mlp.parameters())
 
         return {
             "loss_cont": loss_cont,
@@ -481,9 +459,7 @@ class Trainer:
                 
                 if (iter_count + 1) % self.accumulation_steps == 0:
                     self.scaler.unscale_(self.optimizer)
-                    trainable_params = [p for p in self.mlp.parameters() if p.requires_grad] + [p for p in self.region_encoder.parameters() if p.requires_grad]
-
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.max_grad_norm)
 
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -492,10 +468,8 @@ class Trainer:
                 
                 # Log progress
                 if (iter_count + 1) % self.logging_steps == 0:
-                    self.region_encoder.eval()
                     self.mlp.eval()
                     val_outputs = self.validate(extractor_name=extractor_name)
-                    self.region_encoder.train()
                     self.mlp.train()
                     val_loss = val_outputs['loss']
                     val_loss_cont = val_outputs['loss_cont']
