@@ -479,30 +479,20 @@ class TokenAggregator(nn.Module):
 
 
 class TemporalTokenAggregator(nn.Module):
-    def __init__(self, merging_threshold):
+    def __init__(self, merging_threshold=0.75, mlp=None):
         super().__init__()
         self.merging_threshold = merging_threshold
+        self.mlp = mlp
         self.reset()
 
     def reset(self):
-        # Observed tokens (what we ultimately want to average across time)
         self.track_pred_tokens = []
-        # Post-MLP tokens (used only for similarity / merging)
-        self.track_pred_tokens_post = []
         self.track_text_aligned_tokens = []
-        # Match tokens for association: mlp(ren_t) vs ren_{t+1} (same as temporal train loss)
-        self.track_match_pred_tokens = []
         self.track_region_points = []
         self.track_counts = []
         self.track_last_frame = []
         self.track_members = []
-
-    @staticmethod
-    def _token_valid_mask(tokens, min_norm=1e-6):
-        # A token is valid if all dimensions are finite and L2 norm is non-trivial.
-        finite = torch.isfinite(tokens).all(dim=-1)
-        norm_ok = torch.norm(tokens, dim=-1) > min_norm
-        return finite & norm_ok
+        self.track_next_pred_tokens = []
 
     def get_region_point(self, region_mask, frame_resolution):
         flat_idx = region_mask.reshape(-1).argmax().item()
@@ -522,105 +512,77 @@ class TemporalTokenAggregator(nn.Module):
         x = min(max(x, 0), frame_w - 1)
         return (y, x)
 
+    def _predict_next(self, tokens):
+        """Apply MLP to predict next-frame tokens. Falls back to identity if no MLP."""
+        if self.mlp is not None:
+            return self.mlp(tokens)
+        return tokens
+
     @torch.inference_mode()
-    def update(
-        self,
-        curr_pred_tokens,
-        curr_text_aligned_tokens,
-        curr_region_masks,
-        frame_id,
-        frame_resolution,
-        next_pred_tokens=None,
-        curr_region_points=None,
-    ):
+    def update(self, curr_pred_tokens, curr_text_aligned_tokens, curr_region_masks,
+               frame_id, frame_resolution, curr_region_points=None):
         if curr_pred_tokens.numel() == 0:
             return
-        if next_pred_tokens is None:
-            # Fallback: no temporal matching signal beyond similarity of observed tokens.
-            next_pred_tokens = curr_pred_tokens
-        # Sanitize non-finite values to avoid NaNs in similarity operations.
-        curr_pred_tokens = torch.nan_to_num(curr_pred_tokens)
-        curr_text_aligned_tokens = torch.nan_to_num(curr_text_aligned_tokens)
-        next_pred_tokens = torch.nan_to_num(next_pred_tokens)
-        curr_valid = self._token_valid_mask(curr_pred_tokens)
-        next_valid = self._token_valid_mask(next_pred_tokens)
-        # Use the stricter joint validity for association state.
-        token_valid = curr_valid & next_valid
-        
-        # If this is the first frame, start one track per region
+
         num_regions = curr_pred_tokens.shape[0]
+        next_pred_tokens = self._predict_next(curr_pred_tokens)
+
+        def _get_point(region_idx):
+            if curr_region_points is not None:
+                return curr_region_points[region_idx]
+            return self.get_region_point(curr_region_masks[region_idx].clone(), frame_resolution)
+
         if len(self.track_pred_tokens) == 0:
             for region_idx in range(num_regions):
-                if not bool(token_valid[region_idx].item()):
-                    continue
                 self.track_pred_tokens.append(curr_pred_tokens[region_idx].clone())
-                self.track_pred_tokens_post.append(next_pred_tokens[region_idx].clone())
                 self.track_text_aligned_tokens.append(curr_text_aligned_tokens[region_idx].clone())
-                self.track_match_pred_tokens.append(next_pred_tokens[region_idx].clone())
-                if curr_region_points is not None:
-                    point = tuple(int(v) for v in curr_region_points[region_idx])
-                else:
-                    point = self.get_region_point(curr_region_masks[region_idx].clone(), frame_resolution)
-                self.track_region_points.append([point])
+                self.track_region_points.append([_get_point(region_idx)])
                 self.track_counts.append(1)
                 self.track_last_frame.append(frame_id)
                 self.track_members.append([(frame_id, region_idx)])
+                self.track_next_pred_tokens.append(next_pred_tokens[region_idx].clone())
             return
 
-        # Fetch track indices that ended at previous frame
         active_track_idxs = [k for k, f in enumerate(self.track_last_frame) if f == frame_id - 1]
 
-        # If there are no active tracks, start new ones
         if len(active_track_idxs) == 0:
             for region_idx in range(num_regions):
-                if not bool(token_valid[region_idx].item()):
-                    continue
                 self.track_pred_tokens.append(curr_pred_tokens[region_idx].clone())
-                self.track_pred_tokens_post.append(next_pred_tokens[region_idx].clone())
                 self.track_text_aligned_tokens.append(curr_text_aligned_tokens[region_idx].clone())
-                self.track_match_pred_tokens.append(next_pred_tokens[region_idx].clone())
-                if curr_region_points is not None:
-                    point = tuple(int(v) for v in curr_region_points[region_idx])
-                else:
-                    point = self.get_region_point(curr_region_masks[region_idx].clone(), frame_resolution)
-                self.track_region_points.append([point])
+                self.track_region_points.append([_get_point(region_idx)])
                 self.track_counts.append(1)
                 self.track_last_frame.append(frame_id)
                 self.track_members.append([(frame_id, region_idx)])
+                self.track_next_pred_tokens.append(next_pred_tokens[region_idx].clone())
             return
 
-        # If there are active tracks, fetch the active track tokens
-        active_track_match_pred_tokens = [self.track_match_pred_tokens[k] for k in active_track_idxs]
-        active_track_match_pred_tokens = torch.stack(active_track_match_pred_tokens, dim=0)
-        num_active_tracks = active_track_match_pred_tokens.shape[0]
-        active_valid = self._token_valid_mask(active_track_match_pred_tokens)
+        # Use MLP predictions from previous frame for similarity matching
+        active_track_match_tokens = torch.stack(
+            [self.track_next_pred_tokens[k] for k in active_track_idxs], dim=0
+        )
+        num_active_tracks = active_track_match_tokens.shape[0]
 
-        # Queries = mlp(ren) from frame t; keys = raw ren on frame t+1 (detached targets in training)
         curr_pred_tokens_norm = F.normalize(curr_pred_tokens, p=2, dim=-1)
-        active_track_match_pred_tokens_norm = F.normalize(active_track_match_pred_tokens, p=2, dim=-1)
-        similarity = torch.mm(active_track_match_pred_tokens_norm, curr_pred_tokens_norm.t())
-        # Invalid tracks/tokens cannot participate in matching.
-        if (~active_valid).any():
-            similarity[~active_valid, :] = -1e9
-        if (~token_valid).any():
-            similarity[:, ~token_valid] = -1e9
+        active_match_norm = F.normalize(active_track_match_tokens, p=2, dim=-1)
+        similarity = torch.mm(active_match_norm, curr_pred_tokens_norm.t())
 
-        # Greedy one-to-one matching on tensor similarities (much faster than Python candidate sort)
+        # Avoid O(N_a * N_r) Python nested loops + huge candidate lists (painfully slow for
+        # temporal_only mode where N_r is full grid N0). Sort flattened scores on device, then greedy match.
+        thr = float(self.merging_threshold) if not isinstance(self.merging_threshold, torch.Tensor) else float(self.merging_threshold.item())
+        sim_flat = similarity.reshape(-1)
+        pair_order = sim_flat.argsort(descending=True)
         used_active, used_regions = set(), set()
-        sim_work = similarity.clone()
-        max_matches = min(num_active_tracks, num_regions)
-        for _ in range(max_matches):
-            flat_idx = sim_work.argmax()
-            best_val = sim_work.view(-1)[flat_idx]
-            if best_val < self.merging_threshold:
+        for k in range(pair_order.numel()):
+            similarity_score = sim_flat[pair_order[k]]
+            if float(similarity_score.item()) < thr:
                 break
-
-            active_idx = int((flat_idx // num_regions).item())
-            region_idx = int((flat_idx % num_regions).item())
+            if len(used_regions) == num_regions or len(used_active) == num_active_tracks:
+                break
+            flat_i = int(pair_order[k].item())
+            active_idx = flat_i // num_regions
+            region_idx = flat_i % num_regions
             if active_idx in used_active or region_idx in used_regions:
-                sim_work[active_idx, region_idx] = -1e9
                 continue
-
             used_active.add(active_idx)
             used_regions.add(region_idx)
             track_idx = active_track_idxs[active_idx]
@@ -628,63 +590,36 @@ class TemporalTokenAggregator(nn.Module):
 
             self.track_pred_tokens[track_idx] = \
                 (self.track_pred_tokens[track_idx] * track_count + curr_pred_tokens[region_idx]) / (track_count + 1)
-            self.track_pred_tokens_post[track_idx] = \
-                (self.track_pred_tokens_post[track_idx] * track_count + next_pred_tokens[region_idx]) / (track_count + 1)
             self.track_text_aligned_tokens[track_idx] = \
                 (self.track_text_aligned_tokens[track_idx] * track_count + curr_text_aligned_tokens[region_idx]) / (track_count + 1)
-            # One-step MLP from the last matched frame only (not a running average), for t→t+1 matching
-            self.track_match_pred_tokens[track_idx] = next_pred_tokens[region_idx].clone()
-            if curr_region_points is not None:
-                point = tuple(int(v) for v in curr_region_points[region_idx])
-            else:
-                point = self.get_region_point(curr_region_masks[region_idx].clone(), frame_resolution)
-            self.track_region_points[track_idx].append(point)
+            self.track_region_points[track_idx].append(_get_point(region_idx))
             self.track_counts[track_idx] = track_count + 1
             self.track_last_frame[track_idx] = frame_id
             self.track_members[track_idx].append((frame_id, region_idx))
+            self.track_next_pred_tokens[track_idx] = next_pred_tokens[region_idx].clone()
 
-            sim_work[active_idx, :] = -1e9
-            sim_work[:, region_idx] = -1e9
-
-        # Start a new track for unmatched regions
         for region_idx in range(num_regions):
             if region_idx in used_regions:
                 continue
-            if not bool(token_valid[region_idx].item()):
-                continue
             self.track_pred_tokens.append(curr_pred_tokens[region_idx].clone())
-            self.track_pred_tokens_post.append(next_pred_tokens[region_idx].clone())
             self.track_text_aligned_tokens.append(curr_text_aligned_tokens[region_idx].clone())
-            self.track_match_pred_tokens.append(next_pred_tokens[region_idx].clone())
-            if curr_region_points is not None:
-                point = tuple(int(v) for v in curr_region_points[region_idx])
-            else:
-                point = self.get_region_point(curr_region_masks[region_idx].clone(), frame_resolution)
-            self.track_region_points.append([point])
+            self.track_region_points.append([_get_point(region_idx)])
             self.track_counts.append(1)
             self.track_last_frame.append(frame_id)
             self.track_members.append([(frame_id, region_idx)])
+            self.track_next_pred_tokens.append(next_pred_tokens[region_idx].clone())
 
     @torch.inference_mode()
     def get_result(self):
         if len(self.track_pred_tokens) == 0:
-            return {
-                "track_pred_tokens": torch.empty(0, 0),
-                "track_pred_tokens_post": torch.empty(0, 0),
-                "track_match_tokens": torch.empty(0, 0),
-                "track_text_aligned_tokens": torch.empty(0, 0),
-                "track_region_points": [],
-                "track_members": [],
-            }
+            return torch.empty(0), []
         track_pred_tokens = torch.stack(self.track_pred_tokens, dim=0)
-        track_pred_tokens_post = torch.stack(self.track_pred_tokens_post, dim=0)
-        track_match_tokens = torch.stack(self.track_match_pred_tokens, dim=0)
         track_text_aligned_tokens = torch.stack(self.track_text_aligned_tokens, dim=0)
+        track_match_tokens = torch.stack(self.track_next_pred_tokens, dim=0)
         return {
             'track_pred_tokens': track_pred_tokens,
-            'track_pred_tokens_post': track_pred_tokens_post,
-            'track_match_tokens': track_match_tokens,
             'track_text_aligned_tokens': track_text_aligned_tokens,
+            'track_match_tokens': track_match_tokens,
             'track_region_points': self.track_region_points,
             'track_members': self.track_members,
         }

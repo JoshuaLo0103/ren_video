@@ -172,26 +172,26 @@ class Evaluator():
         # Instantiate the dataloaders
         self.target_data = config['data']['target_data']
 
-        train_dataset = CamVidClipDataset(
+        train_dataset = VSPWClipDataset(
             config,
             split="train",
             augment=False,
-            frames_per_video=2,
+            frames_per_video=8,
             sampling="window",
             seed=seed,
-            #events_csv="",
-            #event_sampling=False,
+            events_csv="",
+            event_sampling=False,
         )
-        val_dataset = CamVidClipDataset(
+        val_dataset = VSPWClipDataset(
             config,
             split="val",
             augment=False,
-            frames_per_video=2,
+            frames_per_video=8,
             sampling="window",
             seed=seed,
             #events_csv="../vspw_strict.csv",
-            #events_csv="",
-            #event_sampling=False,
+            events_csv="",
+            event_sampling=False,
         )
 
         self.train_loader = DataLoader(
@@ -242,8 +242,8 @@ class Evaluator():
         self.grid_points = torch.tensor([(y, x) for y in y_coords for x in x_coords])
 
         # Load checkpoints
-        self.ren_checkpoint = os.path.join(config['ren']['logging']['save_dir'], config['ren']['logging']['exp_name'], '1.0 more finetune new vit.pth')
-        self.decoder_checkpoint = os.path.join(self.exp_dir, 'camvid 1.0.pth')
+        self.ren_checkpoint = os.path.join(config['ren']['logging']['save_dir'], config['ren']['logging']['exp_name'], 'checkpoint.pth')
+        self.decoder_checkpoint = os.path.join(self.exp_dir, 'cosine loss decoder.pth')
         self.load_ren()
         self.load_decoder()
 
@@ -353,7 +353,10 @@ class Evaluator():
                     # - temporal_only=True: skip in-frame TokenAggregator, track per-grid tokens across time.
                     # - temporal_only=False: Stage 1 (in-frame) TokenAggregator, then Stage 2 (temporal).
                     temporal_trackers = [
-                        TemporalTokenAggregator(merging_threshold=self.temporal_token_aggregator.merging_threshold)
+                        TemporalTokenAggregator(
+                            merging_threshold=self.temporal_token_aggregator.merging_threshold,
+                            mlp=self.mlp if use_mlp_temporal else None,
+                        )
                         for _ in range(B)
                     ]
                     for tt in temporal_trackers:
@@ -374,21 +377,15 @@ class Evaluator():
                         tp = torch.full((N0, 1), t, device=frame_tok.device, dtype=gp.dtype)
                         pts = torch.cat([tp, gp], dim=1)  # [N0,3]
                         if temporal_only:
-                            # Temporal-only tracking on per-grid tokens (no in-frame merges).
-                            # Each token is treated as its own region, with region_idx == token index.
                             if not disable_temporal_stage:
+                                curr_region_points = [(int(y.item()), int(x.item())) for y, x in gp]
                                 for b_idx in range(B):
-                                    curr_pred_tokens = frame_tok[b_idx]   # [N0, D]
-                                    curr_text_tokens = frame_proj[b_idx]  # [N0, D]
-                                    curr_region_points = [(int(y.item()), int(x.item())) for y, x in gp]
-                                    next_pred_tokens = self.mlp(curr_pred_tokens) if use_mlp_temporal else curr_pred_tokens
                                     temporal_trackers[b_idx].update(
-                                        curr_pred_tokens=curr_pred_tokens,
-                                        curr_text_aligned_tokens=curr_text_tokens,
+                                        curr_pred_tokens=frame_tok[b_idx],
+                                        curr_text_aligned_tokens=frame_proj[b_idx],
                                         curr_region_masks=None,
                                         frame_id=t,
                                         frame_resolution=(self.grid_size, self.grid_size),
-                                        next_pred_tokens=next_pred_tokens,
                                         curr_region_points=curr_region_points,
                                     )
                             # For bookkeeping consistency in later scatter, we don't store grouped_points_by_frame.
@@ -418,7 +415,6 @@ class Evaluator():
                                     curr_pred_tokens = agg1["aggregated_pred_tokens"][b_idx]   # [G, D]
                                     curr_text_tokens = agg1["aggregated_proj_tokens"][b_idx]   # [G, D]
                                     curr_groups = agg1["all_grouped_points"][b_idx]            # list len G, each [Mi,3]
-                                    # representative (y,x) point per stage-1 group for bookkeeping
                                     curr_region_points = []
                                     for members in curr_groups:
                                         if len(members) == 0:
@@ -428,46 +424,12 @@ class Evaluator():
                                             x = int(torch.round(members[:, 2].float().mean()).item())
                                             curr_region_points.append((y, x))
 
-                                    # Pattern B association:
-                                    # - if enabled: match using MLP(curr)->next prediction
-                                    # - if disabled: match using original REN output tokens (no MLP)
-                                    if use_mlp_temporal:
-                                        # Correctness w.r.t. how the MLP is trained:
-                                        # apply MLP per *member token* (prompt token granularity),
-                                        # then average within the stage-1 group => mean(mlp(tokens)).
-                                        # curr_pred_tokens is already mean(group_members), so we do NOT
-                                        # do mlp(curr_pred_tokens) here.
-                                        D = curr_pred_tokens.shape[-1]
-                                        next_pred_tokens_list = []
-                                        for members in curr_groups:  # each: [Mi, 3] = (t, y, x)
-                                            if members.numel() == 0:
-                                                next_pred_tokens_list.append(
-                                                    torch.zeros((D,), device=curr_pred_tokens.device, dtype=curr_pred_tokens.dtype)
-                                                )
-                                                continue
-
-                                            ys = members[:, 1]
-                                            xs = members[:, 2]
-                                            # Map patch-center pixel coords (y,x) -> token indices in [0..N0).
-                                            gy = (ys // self.patch_size).clamp(0, self.grid_size - 1)
-                                            gx = (xs // self.patch_size).clamp(0, self.grid_size - 1)
-                                            token_idxs = (gy * self.grid_size + gx).long()
-
-                                            member_tokens = frame_tok[b_idx, token_idxs]  # [Mi, D]
-                                            pred_members = self.mlp(member_tokens)  # [Mi, D]
-                                            next_pred_tokens_list.append(pred_members.mean(dim=0))  # [D]
-
-                                        next_pred_tokens = torch.stack(next_pred_tokens_list, dim=0)  # [G, D]
-                                    else:
-                                        next_pred_tokens = curr_pred_tokens  # [G, D]
-
                                     temporal_trackers[b_idx].update(
                                         curr_pred_tokens=curr_pred_tokens,
                                         curr_text_aligned_tokens=curr_text_tokens,
                                         curr_region_masks=None,
                                         frame_id=t,
                                         frame_resolution=(self.grid_size, self.grid_size),
-                                        next_pred_tokens=next_pred_tokens,
                                         curr_region_points=curr_region_points,
                                     )
 
