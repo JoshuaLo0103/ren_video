@@ -10,8 +10,9 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import autocast
 from video_dataloader import VSPWClipDataset, CamVidClipDataset
-from decoder import VSPWDecoderLinear
+from decoder import VSPWDecoderLinear, CamVidDecoderLinear
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append('..')
 sys.path.append('../segment_anything/')
@@ -176,7 +177,7 @@ class Evaluator():
             config,
             split="train",
             augment=False,
-            frames_per_video=8,
+            frames_per_video=16,
             sampling="window",
             seed=seed,
             events_csv="",
@@ -186,7 +187,7 @@ class Evaluator():
             config,
             split="val",
             augment=False,
-            frames_per_video=8,
+            frames_per_video=16,
             sampling="window",
             seed=seed,
             #events_csv="../vspw_strict.csv",
@@ -220,7 +221,7 @@ class Evaluator():
         # When using temporal-only tracking (no within-frame TokenAggregator), the
         # token count is large (N0 grid cells). A low threshold encourages merging
         # to keep track count manageable and avoid truncation at decode time.
-        temporal_thr = config.get('ren', {}).get('parameters', {}).get('temporal_merging_threshold', 0.9)
+        temporal_thr = config.get('ren', {}).get('parameters', {}).get('temporal_merging_threshold', 0.85)
         self.temporal_token_aggregator = TemporalTokenAggregator(merging_threshold=temporal_thr)
         D = config['ren']['architecture']['hidden_dim']
         
@@ -242,8 +243,10 @@ class Evaluator():
         self.grid_points = torch.tensor([(y, x) for y in y_coords for x in x_coords])
 
         # Load checkpoints
-        self.ren_checkpoint = os.path.join(config['ren']['logging']['save_dir'], config['ren']['logging']['exp_name'], 'checkpoint.pth')
-        self.decoder_checkpoint = os.path.join(self.exp_dir, 'cosine loss decoder.pth')
+        ren_dir = os.path.join(config['ren']['logging']['save_dir'], config['ren']['logging']['exp_name'])
+        self.ren_checkpoint = os.path.join(ren_dir, 'checkpoint.pth')
+        self.mlp_checkpoint = os.path.join(ren_dir, 'checkpoint_latest.pth')
+        self.decoder_checkpoint = os.path.join(self.exp_dir, 'mlp latest only decoder.pth')
         self.load_ren()
         self.load_decoder()
 
@@ -283,19 +286,42 @@ class Evaluator():
         plt.close()
 
     def load_ren(self):
-        if os.path.exists(self.ren_checkpoint):
+        debug_random_re = False
+        if debug_random_re:
+            print(
+                '[debug] REN_DEBUG_RANDOM_REGION_ENCODER: skipping trained RegionEncoder weights; '
+                'using default __init__ weights (see seed at top of video_eval_old.py).'
+            )
+        else:
+            if not os.path.exists(self.ren_checkpoint):
+                print(f'No REN checkpoint found at {self.ren_checkpoint}, exiting.')
+                exit()
             checkpoint = torch.load(self.ren_checkpoint)
             self.region_encoder.load_state_dict(checkpoint['region_encoder_state'])
-            if 'mlp_state' in checkpoint:
-                self.mlp.load_state_dict(checkpoint['mlp_state'], strict=False)
-            else:
-                print('Checkpoint has no mlp_state; MLP remains randomly initialized.')
             ren_epoch = checkpoint['epoch']
             ren_iter = checkpoint['iter_count']
-            print(f'Loaded REN checkpoint trained for {ren_epoch} epochs, {ren_iter} iterations.')
+            print(f'Loaded RegionEncoder from checkpoint.pth (epoch {ren_epoch}, iter {ren_iter}).')
+
+        if os.path.exists(self.mlp_checkpoint):
+            mlp_ckpt = torch.load(self.mlp_checkpoint)
+            print(f'[debug] MLP checkpoint path: {self.mlp_checkpoint}')
+            print(f'[debug] MLP checkpoint top-level keys: {list(mlp_ckpt.keys())}')
+            if 'mlp_state' in mlp_ckpt:
+                sd = mlp_ckpt['mlp_state']
+                print(f'[debug] mlp_state has {len(sd)} tensors; sample keys: {list(sd.keys())[:3]}')
+                missing, unexpected = self.mlp.load_state_dict(sd, strict=False)
+                print(f'[debug] MLP load_state_dict: missing={len(missing)} unexpected={len(unexpected)}')
+                if missing:
+                    print(f'[debug] missing (first 8): {missing[:8]}')
+                if unexpected:
+                    print(f'[debug] unexpected (first 8): {unexpected[:8]}')
+                k0 = next(iter(self.mlp.state_dict()))
+                print(f'[debug] MLP loaded; param {k0!r} abs-mean={self.mlp.state_dict()[k0].abs().mean().item():.6f}')
+                print('Loaded MLP from checkpoint_latest.pth.')
+            else:
+                print('[debug] No mlp_state key in checkpoint_latest.pth; MLP remains randomly initialized.')
         else:
-            print('No REN checkpoint found, exiting.')
-            exit()
+            print(f'[debug] No MLP checkpoint file at {self.mlp_checkpoint}; MLP remains randomly initialized.')
 
     def load_decoder(self):
         if os.path.exists(self.decoder_checkpoint):
@@ -306,6 +332,45 @@ class Evaluator():
             print('No decoder checkpoint found, exiting.')
             exit()
 
+    @torch.no_grad()
+    def mlp_next_frame_temporal_loss(self, batch):
+        """
+        Same objective as video_ren_train.Trainer.step loss_temp: from pred_tokens at t,
+        MLP predicts t+1; loss is mean(1 - cos(pred_next, tgt)) over valid positions.
+        Uses this eval script's forward (resize=False, self.grid_points). Training uses the
+        same resize=False (video_ren_train.upsample_features is False).
+        """
+        images = batch["image"].to(device)
+        B, T, C, H, W = images.shape
+        N0 = self.grid_size * self.grid_size
+        images_flat = images.view(B * T, C, H, W)
+        self.mlp.eval()
+        eps = 1e-8
+        with autocast(dtype=torch.bfloat16):
+            _, feature_maps = self.feature_extractor(self.extractor_name, images_flat, resize=False)
+            prompts_flat = [self.grid_points for _ in range(B * T)]
+            ren = self.region_encoder(feature_maps, prompts_flat)
+            pred_bt = ren["pred_tokens"]
+            D = pred_bt.shape[-1]
+            pred_seq = pred_bt.view(B, T, N0, D)
+            loss_temp = torch.zeros((), device=pred_seq.device, dtype=pred_seq.dtype)
+            pair_count = 0
+            for t in range(T - 1):
+                ctx = pred_seq[:, t]
+                tgt = pred_seq[:, t + 1]
+                pred_next = self.mlp(ctx)
+                per_pos = 1.0 - F.cosine_similarity(pred_next, tgt, dim=-1, eps=eps)
+                finite_t = torch.isfinite(ctx).all(dim=-1) & (torch.norm(ctx, dim=-1) > 1e-6)
+                finite_tp1 = torch.isfinite(tgt).all(dim=-1) & (torch.norm(tgt, dim=-1) > 1e-6)
+                valid = (finite_t & finite_tp1).float()
+                if valid.sum() < 0.5:
+                    continue
+                denom = valid.sum().clamp(min=1e-6)
+                loss_temp = loss_temp + (per_pos * valid).sum() / denom
+                pair_count += 1
+            if pair_count > 0:
+                loss_temp = loss_temp / pair_count
+        return float(loss_temp.item()), pair_count
 
     
     def step(
@@ -322,13 +387,7 @@ class Evaluator():
         N0 = self.grid_size * self.grid_size
         valid_tokens_total = 0.0
         valid_tokens_count = 0
-        valid_tracks_before_postmerge_total = 0.0
-        invalid_tracks_before_postmerge_total = 0.0
-        valid_groups_after_postmerge_total = 0.0
-        invalid_groups_after_postmerge_total = 0.0
-        # Filled on temporal decode path: tracks from TemporalTokenAggregator, then groups after post-temporal merge.
         tracks_after_temporal_mean = None
-        groups_after_track_aggregate_mean = None
 
         # Flatten frames for REN/feature extractor
         images_flat = images.view(B * T, C, H, W)
@@ -439,19 +498,13 @@ class Evaluator():
                             # per-frame decode on the full grid (no grouping/tracking).
                             region_tokens = pred_bt.view(B * T, self.grid_size, self.grid_size, D)
                             outputs = self.decoder(region_tokens.permute(0, 3, 1, 2))  # [BT, K, GS, GS]
-                            total_tokens_in_video = float(N0)
-                            total_used_tokens_in_video = float(N0)
                         else:
                             # Stage-1-only ablation: decode each frame's groups directly.
                             outputs_grid = None
-                            total_tokens_in_video = 0.0
-                            total_used_tokens_in_video = 0.0
                             for b_idx in range(B):
                                 for t in range(T):
                                     tok = stage1_tokens_by_frame[t][b_idx]  # [G,D]
                                     G = tok.shape[0]
-                                    total_tokens_in_video += float(G)
-                                    total_used_tokens_in_video += float(G)
                                     if G == 0:
                                         continue
                                     # Decode all stage-1 groups directly: [1, D, G, 1] -> [1, K, G, 1]
@@ -476,8 +529,6 @@ class Evaluator():
                                             if 0 <= t_idx < T and 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
                                                 p_idx = gy * self.grid_size + gx
                                                 outputs_grid[b_idx, t_idx, p_idx] = gl
-                            total_tokens_in_video = total_tokens_in_video / max(B, 1)
-                            total_used_tokens_in_video = total_used_tokens_in_video / max(B, 1)
                             if outputs_grid is None:
                                 K = self.num_classes
                                 outputs_grid = torch.zeros((B, T, N0, K), device=pred_bt.device, dtype=pred_bt.dtype)
@@ -485,12 +536,8 @@ class Evaluator():
                             outputs = outputs.permute(0, 3, 1, 2)
                     else:
 
-                        # Collect tracks, merge similar tracks (post-temporal TokenAggregator-style grouping),
-                        # then decode. Uses same similarity graph as in-frame TokenAggregator (group_predictions).
                         final_region_tokens = []
-                        final_grouped_points = []  # list len B; each element list[len_tracks] of tensor points [Mi,3]
-                        total_tokens_in_video = 0.0
-                        total_used_tokens_in_video = 0.0
+                        final_grouped_points = []
                         tracks_after_temporal_sum = 0.0
 
                         for b_idx in range(B):
@@ -502,19 +549,9 @@ class Evaluator():
                                 final_grouped_points.append([])
                                 continue
 
-                            track_pred_tokens = res["track_pred_tokens"]  # [Gf, D] pre-MLP mean (for decoding)
-                            # One-step MLP vectors (last association step); same space as temporal training.
-                            track_match_tokens = res.get("track_match_tokens")
+                            track_pred_tokens = res["track_pred_tokens"]  # [Gf, D]
                             track_members = res["track_members"]          # list len Gf of [(frame_id, region_idx), ...]
                             tracks_after_temporal_sum += float(track_pred_tokens.shape[0])
-                            # Valid track/group definition: finite embedding + non-trivial norm.
-                            if track_pred_tokens.numel() > 0:
-                                pre_valid_mask = (
-                                    torch.isfinite(track_pred_tokens).all(dim=-1)
-                                    & (torch.norm(track_pred_tokens, dim=-1) > 1e-6)
-                                )
-                                valid_tracks_before_postmerge_total += float(pre_valid_mask.sum().item())
-                                invalid_tracks_before_postmerge_total += float((~pre_valid_mask).sum().item())
 
                             # Convert track members to original (t,y,x) member points.
                             grouped_tracks = []
@@ -539,54 +576,10 @@ class Evaluator():
                                 else:
                                     grouped_tracks.append(torch.zeros((0, 3), device=track_pred_tokens.device, dtype=torch.int64))
 
-                            # Post-temporal merge: similarity in MLP / next-step space (latest match
-                            # vector per track), aligned with eval association. Fall back to raw
-                            # means if match tensors missing.
-                            merge_feats = (
-                                track_match_tokens
-                                if track_match_tokens is not None
-                                and track_match_tokens.shape[0] == track_pred_tokens.shape[0]
-                                else track_pred_tokens
-                            )
-                            if merge_feats.shape[0] > 0:
-                                merge_groups = group_predictions(
-                                    merge_feats,
-                                    similarity_threshold=self.intra_frame_merging_threshold,
-                                    min_component_size=1,
-                                    merge_small_groups=False,
-                                )
-                                merged_pred = []
-                                merged_grouped = []
-                                for g in merge_groups:
-                                    idx_t = torch.tensor(g, device=track_pred_tokens.device, dtype=torch.long)
-                                    merged_pred.append(track_pred_tokens[idx_t].mean(dim=0))
-                                    parts = [grouped_tracks[i] for i in g]
-                                    if len(parts) > 0:
-                                        merged_grouped.append(torch.cat(parts, dim=0))
-                                    else:
-                                        merged_grouped.append(
-                                            torch.zeros((0, 3), device=track_pred_tokens.device, dtype=torch.int64)
-                                        )
-                                track_pred_tokens = torch.stack(merged_pred, dim=0)
-                                grouped_tracks = merged_grouped
-                            if track_pred_tokens.numel() > 0:
-                                post_valid_mask = (
-                                    torch.isfinite(track_pred_tokens).all(dim=-1)
-                                    & (torch.norm(track_pred_tokens, dim=-1) > 1e-6)
-                                )
-                                valid_groups_after_postmerge_total += float(post_valid_mask.sum().item())
-                                invalid_groups_after_postmerge_total += float((~post_valid_mask).sum().item())
-
                             final_region_tokens.append(track_pred_tokens)
                             final_grouped_points.append(grouped_tracks)
 
-                            total_tokens_in_video += float(track_pred_tokens.shape[0])
-                            total_used_tokens_in_video += float(track_pred_tokens.shape[0])
-
-                        total_tokens_in_video = total_tokens_in_video / max(B, 1)
-                        total_used_tokens_in_video = total_used_tokens_in_video / max(B, 1)
                         tracks_after_temporal_mean = tracks_after_temporal_sum / max(B, 1)
-                        groups_after_track_aggregate_mean = total_tokens_in_video
 
                         # Decode all track tokens directly, then scatter logits back.
                         outputs_grid = None
@@ -627,8 +620,6 @@ class Evaluator():
                     D = pred_bt.shape[-1]
                     region_tokens = pred_bt.view(B * T, self.grid_size, self.grid_size, D)
                     outputs = self.decoder(region_tokens.permute(0, 3, 1, 2)) 
-                    total_tokens_in_video = float(N0)
-                    total_used_tokens_in_video = float(N0)
                     stage1_groups_total = float(B * T * N0)
                     stage1_groups_count = B * T
 
@@ -637,26 +628,14 @@ class Evaluator():
 
         dbg = {
             "stage1_groups_per_frame": stage1_groups_total / max(stage1_groups_count, 1),
-            "tracks_per_video_raw": float(total_tokens_in_video),
-            "tracks_per_video_used": float(total_used_tokens_in_video),
-            "valid_tokens_ratio": float(valid_tokens_total / max(valid_tokens_count, 1)),
-            "invalid_tokens_ratio": float(1.0 - (valid_tokens_total / max(valid_tokens_count, 1))),
-            "valid_tracks_before_postmerge": float(valid_tracks_before_postmerge_total / max(B, 1)),
-            "invalid_tracks_before_postmerge": float(invalid_tracks_before_postmerge_total / max(B, 1)),
-            "valid_groups_after_postmerge": float(valid_groups_after_postmerge_total / max(B, 1)),
-            "invalid_groups_after_postmerge": float(invalid_groups_after_postmerge_total / max(B, 1)),
         }
         if tracks_after_temporal_mean is not None:
-            dbg["tracks_after_temporal"] = float(tracks_after_temporal_mean)
-            dbg["groups_after_track_aggregate"] = float(groups_after_track_aggregate_mean)
-            dbg["tracks_per_video_raw"] = float(tracks_after_temporal_mean)
-            dbg["tracks_per_video_used"] = float(groups_after_track_aggregate_mean)
+            dbg["tracks_per_video"] = float(tracks_after_temporal_mean)
 
         return {
             "images": images,
             "predictions": preds,
             "targets": masks,
-            "tokens_in_video": total_tokens_in_video,
             "debug_stats": dbg,
         }
 
@@ -670,27 +649,34 @@ class Evaluator():
         use_mlp_temporal: bool = True,
         disable_temporal_stage: bool = False,
         temporal_only: bool = False,
+        mlp_temporal_sanity_check: bool = True,
     ):
         dataloader = self.val_loader if split == "val" else self.train_loader
         dataset = dataloader.dataset
 
+        skip_sanity = os.environ.get('REN_SKIP_MLP_TEMPORAL_SANITY', '').lower() in ('1', 'true', 'yes')
+        if mlp_temporal_sanity_check and not skip_sanity:
+            try:
+                dataset.set_epoch(start_epoch)
+                batch0 = next(iter(dataloader))
+                lt, n_pairs = self.mlp_next_frame_temporal_loss(batch0)
+                print(
+                    f'[mlp temporal sanity] loss_temp (mean 1-cos over time, like video_ren_train): '
+                    f'{lt:.6f}  (used {n_pairs} (t,t+1) steps, T={batch0["image"].shape[1]})'
+                )
+            except StopIteration:
+                print('[mlp temporal sanity] skipped (empty dataloader)')
+            except Exception as e:
+                print(f'[mlp temporal sanity] failed: {e}')
+
         all_mious = []
-        all_tokens = []
 
         for p in range(num_passes):
             dataset.set_epoch(start_epoch + p)
 
             confmat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64, device="cpu")
-            tokens = 0.0
-            used_tokens = 0.0
             stage1_groups = 0.0
             tracks_after_temporal = 0.0
-            groups_after_track_aggregate = 0.0
-            valid_token_ratio = 0.0
-            valid_tracks_before_postmerge = 0.0
-            invalid_tracks_before_postmerge = 0.0
-            valid_groups_after_postmerge = 0.0
-            invalid_groups_after_postmerge = 0.0
             count = 0
             count_track_stats = 0
 
@@ -714,58 +700,29 @@ class Evaluator():
                     ignore_index=255
                 )
 
-                tokens += float(out["tokens_in_video"])
                 if "debug_stats" in out:
                     ds = out["debug_stats"]
-                    used_tokens += float(ds["tracks_per_video_used"])
                     stage1_groups += float(ds["stage1_groups_per_frame"])
-                    valid_token_ratio += float(ds.get("valid_tokens_ratio", 0.0))
-                    valid_tracks_before_postmerge += float(ds.get("valid_tracks_before_postmerge", 0.0))
-                    invalid_tracks_before_postmerge += float(ds.get("invalid_tracks_before_postmerge", 0.0))
-                    valid_groups_after_postmerge += float(ds.get("valid_groups_after_postmerge", 0.0))
-                    invalid_groups_after_postmerge += float(ds.get("invalid_groups_after_postmerge", 0.0))
-                    if "tracks_after_temporal" in ds:
-                        tracks_after_temporal += float(ds["tracks_after_temporal"])
-                        groups_after_track_aggregate += float(ds["groups_after_track_aggregate"])
+                    if "tracks_per_video" in ds:
+                        tracks_after_temporal += float(ds["tracks_per_video"])
                         count_track_stats += 1
                 count += 1
 
                 if max_batches is not None and (i + 1) >= max_batches:
                     break
 
-            mean_tokens = tokens / max(count, 1)
-            mean_used_tokens = used_tokens / max(count, 1)
             mean_stage1_groups = stage1_groups / max(count, 1)
-            mean_valid_token_ratio = valid_token_ratio / max(count, 1)
-            mean_valid_tracks_before = valid_tracks_before_postmerge / max(count, 1)
-            mean_invalid_tracks_before = invalid_tracks_before_postmerge / max(count, 1)
-            mean_valid_groups_after = valid_groups_after_postmerge / max(count, 1)
-            mean_invalid_groups_after = invalid_groups_after_postmerge / max(count, 1)
             miou = confmat_to_miou(confmat)
 
-            # Ordered by pipeline stage.
             print(f"average groups per frame (after in-frame merge) = {mean_stage1_groups}")
             if count_track_stats > 0:
                 mean_tracks = tracks_after_temporal / count_track_stats
-                mean_groups_agg = groups_after_track_aggregate / count_track_stats
-                print(f"average tracks per video (before post-merge) = {mean_tracks}")
-                print(f"average valid tracks per video (before post-merge) = {mean_valid_tracks_before}")
-                print(f"average invalid tracks per video (before post-merge) = {mean_invalid_tracks_before}")
-                print(f"average final groups per video (after post-merge) = {mean_groups_agg}")
-                print(f"average valid final groups per video (after post-merge) = {mean_valid_groups_after}")
-                print(f"average invalid final groups per video (after post-merge) = {mean_invalid_groups_after}")
-            else:
-                print(f"average tokens per video = {mean_tokens}")
-            if self.debug_temporal_stats:
-                print(f"average used tokens per video (after final scatter/decode set) = {mean_used_tokens}")
-                print(f"average valid token ratio (raw frame tokens) = {mean_valid_token_ratio}")
+                print(f"average tracks per video = {mean_tracks}")
             print(f"pass {p+1}: mean_iou={miou}")
 
-            all_tokens.append(mean_tokens)
             all_mious.append(miou)
 
         print("avg mean_iou:", float(np.mean(all_mious)))
-        print("avg_mean_tokens:", float(np.mean(all_tokens)))
 
 
 
@@ -782,7 +739,7 @@ if __name__ == '__main__':
         max_batches=None,
         start_epoch=0,
         disable_temporal_stage=False,
-        use_mlp_temporal=False,
-        temporal_only=True,
+        use_mlp_temporal=True,
+        temporal_only=False,
         )
 
