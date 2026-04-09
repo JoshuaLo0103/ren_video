@@ -77,6 +77,10 @@ class Trainer:
             nn.GELU(),
             nn.Linear(D, D),
         ).to(device)
+        # Small init on final layer so residual starts ≈ identity
+        with torch.no_grad():
+            self.mlp[-1].weight.mul_(0.01)
+            self.mlp[-1].bias.mul_(0.01)
         # Freeze backbone, region pooling, and REN encoder; train only the temporal MLP head.
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
@@ -103,8 +107,12 @@ class Trainer:
         self.checkpoint_path = os.path.join(self.exp_dir, 'checkpoint_latest.pth')
         self.best_val_loss = float('inf')
 
-        # Load checkpoint if it exists
-        self.load_checkpoint()
+        # Load trained RegionEncoder from the REN checkpoint (trained by train.py).
+        self.ren_checkpoint_path = os.path.join(self.exp_dir, 'checkpoint.pth')
+        self.load_ren()
+
+        # Load MLP checkpoint if it exists
+        self.load_checkpoint(full_resume=config.get('full_resume', False))
 
     def sample_prompts(self, n: int):
         # self.grid_points is list[(y,x)] of full grid
@@ -113,55 +121,51 @@ class Trainer:
         idx = np.random.choice(len(self.grid_points), size=n, replace=False)
         return [self.grid_points[i] for i in idx]
 
-    def load_checkpoint(self):
+    def load_ren(self):
+        if not os.path.exists(self.ren_checkpoint_path):
+            print_log(
+                f'WARNING: No trained REN checkpoint at {self.ren_checkpoint_path}. '
+                'RegionEncoder will use random init weights — MLP will train on the wrong token space!',
+                self.exp_dir,
+            )
+            return
+        ckpt = torch.load(self.ren_checkpoint_path, map_location=device)
+        self.region_encoder.load_state_dict(ckpt['region_encoder_state'])
+        print_log(
+            f'Loaded trained RegionEncoder from {self.ren_checkpoint_path} '
+            f'(epoch {ckpt.get("epoch", "?")}, iter {ckpt.get("iter_count", "?")})',
+            self.exp_dir,
+        )
+
+    def load_checkpoint(self, full_resume=False):
         if not os.path.exists(self.checkpoint_path):
             print_log('No checkpoint found, starting training from scratch.', self.exp_dir)
             return
 
         ckpt = torch.load(self.checkpoint_path, map_location=device)
 
-        # --- Resume counters if present ---
-        #self.start_epoch = ckpt.get('epoch', 0)
-        #self.start_iter  = ckpt.get('iter_count', 0)
-        self.start_epoch = 0
-        self.start_iter = 0
-        #self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        self.best_val_loss = 100
-        print_log(f"Resuming from epoch {self.start_epoch}, iter {self.start_iter}")
-        # --- 1) Load old/base model weights if they exist ---
-        # These key names depend on how your old training saved them.
-        # Try common patterns.
-        def try_load(module, keys, name):
-            for k in keys:
-                if k in ckpt:
-                    missing, unexpected = module.load_state_dict(ckpt[k], strict=False)
-                    print_log(f'Loaded {name} from key "{k}". missing={len(missing)} unexpected={len(unexpected)}', self.exp_dir)
-                    return True
-            print_log(f'No weights found in checkpoint for {name}. Tried keys={keys}', self.exp_dir)
-            return False
-
-        # If your old checkpoint saved RegionEncoder weights, load them here:
-        try_load(self.region_encoder, ['region_encoder_state', 'model_state', 'state_dict', 'region_encoder'], 'region_encoder')
-
-        # RegionTokensGenerator has no weights unless it becomes an nn.Module.
-        if hasattr(self.region_tokens_generator, 'load_state_dict'):
-            try_load(self.region_tokens_generator, ['region_tokens_generator_state', 'tokens_generator_state'], 'region_tokens_generator')
-
-        # If you ever saved FeatureExtractor (usually you don’t, since it’s pretrained):
-        try_load(self.feature_extractor, ['feature_extractor_state'], 'feature_extractor')
-
-        # --- 2) Load MLP weights only if present ---
         if 'mlp_state' in ckpt:
             missing, unexpected = self.mlp.load_state_dict(ckpt['mlp_state'], strict=False)
             print_log(f'Loaded MLP from checkpoint. missing={len(missing)} unexpected={len(unexpected)}', self.exp_dir)
-            if 'optimizer_state' in ckpt:
-                self.optimizer.load_state_dict(ckpt['optimizer_state'])
-                print_log('Loaded optimizer_state for MLP.', self.exp_dir)
         else:
-            print_log('Checkpoint has no mlp_state; initializing MLP randomly (base weights loaded if available).', self.exp_dir)
+            print_log('Checkpoint has no mlp_state; initializing MLP randomly.', self.exp_dir)
+
+        if not full_resume:
+            self.start_epoch = 0
+            self.start_iter = 0
+            self.best_val_loss = float('inf')
+            print_log('Loaded weights only; fresh optimizer/scheduler, training from epoch 0.', self.exp_dir)
+            return
+
+        self.start_epoch = ckpt.get('epoch', 0)
+        self.start_iter = ckpt.get('iter_count', 0)
+        self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        print_log(f"Full resume from epoch {self.start_epoch}, iter {self.start_iter}", self.exp_dir)
 
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
+        elif "optimizer_state" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
@@ -173,16 +177,10 @@ class Trainer:
             'epoch': epoch,
             'iter_count': iter_count,
             'best_val_loss': float(self.best_val_loss),
-    
-            # base / frozen modules (store anyway)
-            'region_encoder_state': self.region_encoder.state_dict(),
-            'feature_extractor_state': self.feature_extractor.state_dict(),
-            #'region_tokens_generator_state': self.region_tokens_generator.state_dict(),
+            'mlp_state': self.mlp.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
-            # new module
-            'mlp_state': self.mlp.state_dict(),
         }
         torch.save(checkpoint, path)
         print_log(f'Saved checkpoint to {path} (val_loss={val_loss:.4f}, best={self.best_val_loss:.4f})', self.exp_dir)
@@ -371,7 +369,7 @@ class Trainer:
             for t in range(T - 1):
                 ctx = pred_seq[:, t]
                 tgt = pred_seq[:, t + 1]
-                pred_next = self.mlp(ctx)
+                pred_next = ctx + self.mlp(ctx)
                 per_pos = 1.0 - F.cosine_similarity(pred_next, tgt, dim=-1, eps=eps)
                 valid = (v1_loss_mask[:, t] * v1_loss_mask[:, t + 1]).float()
                 denom = valid.sum().clamp(min=1e-6)
@@ -523,6 +521,8 @@ if __name__ == '__main__':
                         help='Path to config YAML. If not set, uses configs/train_{feature_extractor}.yaml')
     parser.add_argument('--use_wandb', action='store_true',
                         help='Enable Weights & Biases logging')
+    parser.add_argument('--full_resume', action='store_true',
+                        help='Fully resume training from checkpoint (restore optimizer/scheduler/epoch). Without this flag, only model weights are loaded.')
     args = parser.parse_args()
 
     # Set wandb flag
@@ -533,6 +533,9 @@ if __name__ == '__main__':
     config_path = args.config or f'configs/train_{args.feature_extractor}.yaml'
     with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    if args.full_resume:
+        config['full_resume'] = True
 
     trainer = Trainer(config)
     trainer.train()

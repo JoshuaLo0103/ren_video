@@ -336,7 +336,7 @@ class Evaluator():
     def mlp_next_frame_temporal_loss(self, batch):
         """
         Same objective as video_ren_train.Trainer.step loss_temp: from pred_tokens at t,
-        MLP predicts t+1; loss is mean(1 - cos(pred_next, tgt)) over valid positions.
+        residual MLP predicts t+1 as ctx + mlp(ctx); loss is mean(1 - cos(pred_next, tgt)).
         Uses this eval script's forward (resize=False, self.grid_points). Training uses the
         same resize=False (video_ren_train.upsample_features is False).
         """
@@ -358,7 +358,7 @@ class Evaluator():
             for t in range(T - 1):
                 ctx = pred_seq[:, t]
                 tgt = pred_seq[:, t + 1]
-                pred_next = self.mlp(ctx)
+                pred_next = ctx + self.mlp(ctx)
                 per_pos = 1.0 - F.cosine_similarity(pred_next, tgt, dim=-1, eps=eps)
                 finite_t = torch.isfinite(ctx).all(dim=-1) & (torch.norm(ctx, dim=-1) > 1e-6)
                 finite_tp1 = torch.isfinite(tgt).all(dim=-1) & (torch.norm(tgt, dim=-1) > 1e-6)
@@ -371,6 +371,38 @@ class Evaluator():
             if pair_count > 0:
                 loss_temp = loss_temp / pair_count
         return float(loss_temp.item()), pair_count
+
+    def identity_temporal_loss(self, batch):
+        """Identity baseline: predict x_{t+1} = x_t (no MLP). Returns (loss, pair_count)."""
+        images = batch["image"].to(device)
+        B, T, C, H, W = images.shape
+        N0 = self.grid_size * self.grid_size
+        images_flat = images.view(B * T, C, H, W)
+        eps = 1e-8
+        with torch.no_grad(), autocast(dtype=torch.bfloat16):
+            _, feature_maps = self.feature_extractor(self.extractor_name, images_flat, resize=False)
+            prompts_flat = [self.grid_points for _ in range(B * T)]
+            ren = self.region_encoder(feature_maps, prompts_flat)
+            pred_bt = ren["pred_tokens"]
+            D = pred_bt.shape[-1]
+            pred_seq = pred_bt.view(B, T, N0, D)
+            loss_id = torch.zeros((), device=pred_seq.device, dtype=pred_seq.dtype)
+            pair_count = 0
+            for t in range(T - 1):
+                ctx = pred_seq[:, t]
+                tgt = pred_seq[:, t + 1]
+                per_pos = 1.0 - F.cosine_similarity(ctx, tgt, dim=-1, eps=eps)
+                finite_t = torch.isfinite(ctx).all(dim=-1) & (torch.norm(ctx, dim=-1) > 1e-6)
+                finite_tp1 = torch.isfinite(tgt).all(dim=-1) & (torch.norm(tgt, dim=-1) > 1e-6)
+                valid = (finite_t & finite_tp1).float()
+                if valid.sum() < 0.5:
+                    continue
+                denom = valid.sum().clamp(min=1e-6)
+                loss_id = loss_id + (per_pos * valid).sum() / denom
+                pair_count += 1
+            if pair_count > 0:
+                loss_id = loss_id / pair_count
+        return float(loss_id.item()), pair_count
 
     
     def step(
@@ -664,6 +696,12 @@ class Evaluator():
                     f'[mlp temporal sanity] loss_temp (mean 1-cos over time, like video_ren_train): '
                     f'{lt:.6f}  (used {n_pairs} (t,t+1) steps, T={batch0["image"].shape[1]})'
                 )
+                li, ni = self.identity_temporal_loss(batch0)
+                delta = li - lt
+                print(
+                    f'[identity baseline]  loss_temp: {li:.6f}  (used {ni} steps)  '
+                    f'MLP improvement: {delta:+.6f} ({"better" if delta > 0 else "WORSE"} than identity)'
+                )
             except StopIteration:
                 print('[mlp temporal sanity] skipped (empty dataloader)')
             except Exception as e:
@@ -739,7 +777,7 @@ if __name__ == '__main__':
         max_batches=None,
         start_epoch=0,
         disable_temporal_stage=False,
-        use_mlp_temporal=True,
+        use_mlp_temporal=False,
         temporal_only=False,
         )
 
